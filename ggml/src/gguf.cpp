@@ -343,7 +343,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     }
 
     // header
-    int64_t n_kv      = 0;
+    int64_t n_kv      = 0; // 共 n_kv 个元数据项
     int64_t n_tensors = 0;
 
     if (ok && gr.read(ctx->version)) {
@@ -360,6 +360,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
         ok = false;
     }
 
+    // gr.read(n_tensors) 和 gr.read(n_kv) 就是在从输入源（通常是文件/流）里读取这两个计数值到变量 n_tensors、n_kv 中
     if (ok && gr.read(n_tensors)) {
         static_assert(sizeof(size_t) <= 8 && sizeof(gguf_tensor_info) >= 2, "int64_t insufficient for indexing");
         if (n_tensors < 0 || n_tensors > int64_t(SIZE_MAX/sizeof(gguf_tensor_info))) {
@@ -391,12 +392,14 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     // KV pairs
     {
         for (int64_t i = 0; ok && i < n_kv; ++i) {
+            // 定义本条 KV 的临时变量
             std::string key;
             gguf_type   type     = gguf_type(-1);
             bool        is_array = false;
             uint64_t    n        = 1;
 
             try {
+                // 读取 key ，并处理异常
                 ok = ok && gr.read(key);
             } catch (std::length_error &) {
                 GGML_LOG_ERROR("%s: encountered length_error while reading key %" PRIi64 "\n", __func__, i);
@@ -405,6 +408,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
+            // 检查是否与 已有 key 重复
             for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
                 if (key == ctx->kv[j].key) {
                     GGML_LOG_ERROR("%s: duplicate key '%s' for tensors %zu and %" PRIi64 " \n", __func__, key.c_str(), j, i);
@@ -415,16 +419,18 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 break;
             }
 
+            // 读取类型，若是数组类型，继续读取“元素类型”和“数组长度”
             ok = ok && gr.read(type);
             if (type == GGUF_TYPE_ARRAY) {
                 is_array = true;
-                ok = ok && gr.read(type);
-                ok = ok && gr.read(n);
+                ok = ok && gr.read(type); // 再读一次 type, 这次读到的是数组元素的实际类型
+                ok = ok && gr.read(n); // 再读 n 表示数组的长度
             }
             if (!ok) {
                 break;
             }
 
+            // 根据最终的元素类型，调用模板化的读取与入库帮助函数
             switch (type) {
                 case GGUF_TYPE_UINT8:   ok = ok && gguf_read_emplace_helper<uint8_t>    (gr, ctx->kv, key, is_array, n); break;
                 case GGUF_TYPE_INT8:    ok = ok && gguf_read_emplace_helper<int8_t>     (gr, ctx->kv, key, is_array, n); break;
@@ -447,6 +453,8 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
             }
         }
 
+        // 在前面完成 n_kv 条 key-value 对读取之后做收尾检查和参数解析的
+        // 如果前面的循环（读取 KV 数据） 中 ok 变成了 false（读取失败，重复 key， 类型错误），就直接报错并释放上下文 ctx，返回 nullptr
         if (!ok) {
             GGML_LOG_ERROR("%s: failed to read key-value pairs\n", __func__);
             gguf_free(ctx);
@@ -465,6 +473,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     }
 
     // read the tensor info
+    // 循环读取每个张量的元数据
     for (int64_t i = 0; ok && i < n_tensors; ++i) {
         struct gguf_tensor_info info;
 
@@ -552,8 +561,8 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 ok = false;
                 break;
             }
-            const size_t  type_size = ggml_type_size(info.t.type);
-            const int64_t blck_size = ggml_blck_size(info.t.type);
+            const size_t  type_size = ggml_type_size(info.t.type); // 每个块的字节数
+            const int64_t blck_size = ggml_blck_size(info.t.type); // 每块包含的元素数
 
             // check that row size is divisible by block size
             if (blck_size == 0 || info.t.ne[0] % blck_size != 0) {
@@ -564,20 +573,21 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 break;
             }
 
-            // calculate byte offsets given the tensor shape and type
-            info.t.nb[0] = type_size;
-            info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size);
+            // calculate byte offsets given the tensor shape and type 这里是计算步幅，ggml计算框架的约定
+            info.t.nb[0] = type_size;   // 一步跨过一个块的字节数
+            info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size); // 第二维的步长 = 一行的块数 * 每块字节
             for (int j = 2; j < GGML_MAX_DIMS; ++j) {
-                info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
+                info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1]; // ne 是每个维度的元素数量
             }
         }
         if (!ok) {
             break;
         }
 
-        // tensor data offset within buffer
+        // tensor data offset within buffer 数据偏移，读取该张量在数据区（紧随头部之后）中的偏移，以字节计
         ok = ok && gr.read(info.offset);
 
+        // 将每个张量的信息存进来
         ctx->info.push_back(info);
     }
 
@@ -589,6 +599,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
     // we require the data section to be aligned, so take into account any padding
+    // 对齐并定位数据区起点
     if (fseek(file, GGML_PAD(ftell(file), ctx->alignment), SEEK_SET) != 0) {
         GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);
         gguf_free(ctx);
@@ -599,6 +610,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     ctx->offset = ftell(file);
 
     // compute the total size of the data section, taking into account the alignment
+    // 计算数据区总大小，并校验每个张量的偏移
     {
         ctx->size = 0;
         for (size_t i = 0; i < ctx->info.size(); ++i) {
@@ -611,6 +623,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 return nullptr;
             }
             ctx->size += GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
+            // 累加结束后 ctx->size 就是整个数据区的总长度
         }
     }
 
@@ -621,6 +634,9 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
         //   the ggml_tensor structs to the appropriate locations in the binary blob
 
         // compute the exact size needed for the new ggml_context
+        // 计算 ggml 上下文需要的内存
+        // ggml_tensor_overhead 是每个 ggml_tensor 的管理开销字节数，如果 no_alloc 为 true, 只创建 n_tensors 个张量的壳（不分配数据缓冲区）
+        // 否则，还会创建一个大的一维数组来存放所有张量的数据，并把每个张量的 data 指向这块大内存中的对应偏移
         const size_t mem_size =
             params.no_alloc ?
             (n_tensors    )*ggml_tensor_overhead() :
@@ -632,6 +648,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
             /*no_alloc   =*/ params.no_alloc,
         };
 
+        // 申请一个容量为 mem_size 的 ggml 内部内存池；失败则清理返回。
         *params.ctx = ggml_init(pdata);
         if (*params.ctx == nullptr) {
             GGML_LOG_ERROR("%s: failed to initialize ggml context for storing tensors\n", __func__);
@@ -643,7 +660,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
 
         struct ggml_tensor * data = nullptr;
 
-        if (!params.no_alloc) {
+        if (!params.no_alloc) { //  如果 no_alloc 是 false ， 说明需要将张量数据保存到 ctx 中
             data = ggml_new_tensor_1d(ctx_data, GGML_TYPE_I8, ctx->size);
 
             ok = ok && data != nullptr;
@@ -653,7 +670,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
             }
 
             // read the binary blob with the tensor data
-            ok = ok && gr.read(data->data, ctx->size);
+            ok = ok && gr.read(data->data, ctx->size); // 把整个数据区一口气读入 data -> data ，直接把文件中的数据区整体读进来（一次性 I/O，命中缓存/顺序读更高效）。
 
             if (!ok) {
                 GGML_LOG_ERROR("%s: failed to read tensor data binary blob\n", __func__);
@@ -663,7 +680,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 return nullptr;
             }
 
-            ctx->data = data->data;
+            ctx->data = data->data; // 记录这块大内存的裸指针
         }
 
         ggml_set_no_alloc(ctx_data, true);

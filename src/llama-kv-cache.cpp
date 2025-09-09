@@ -40,14 +40,15 @@ llama_kv_cache_unified::llama_kv_cache_unified(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     // create a context for each buffer type
+    // 通过ctx_map 确保同一 buffer type （比如CPU / 某块 GPU） 只创建一个 ggml_context
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*hparams.n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*hparams.n_layer*ggml_tensor_overhead()), // 估计一个只放元数据的大小（两倍是因为每层要放 K 和 V 两个张量的描述符；真正的大数据分配延后由后端完成）
                 /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
+                /*.no_alloc   =*/ true, // 只建元数据，不立刻为张量数据分配内存。这是 GGML 常见用法：先建图和张量，再让后端统一分配设备内存
             };
 
             ggml_context * ctx = ggml_init(params);
@@ -56,7 +57,7 @@ llama_kv_cache_unified::llama_kv_cache_unified(
             }
 
             ctx_map[buft] = ctx;
-            ctxs.emplace_back(ctx);
+            ctxs.emplace_back(ctx); // 把上下文放进一个容器中以便生命周期管理（离开作用域时统一释放）
 
             return ctx;
         }
@@ -64,19 +65,21 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         return it->second;
     };
 
+    // 初始化 KV 缓存的环形缓冲元数据
     head = 0;
-    size = kv_size;
+    size = kv_size; // 最大槽位数（ KV 容量上限）
     used = 0;
 
     cells.resize(kv_size);
 
+    // 逐层决定设备并创建 KV 张量
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (filter && !filter(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, il);
             continue;
         }
 
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s(); // 这是按 GQA 聚合后的 K、V 维度
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
 
         const char * dev_name = "CPU";
@@ -92,7 +95,7 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft); // 用当前层的 buffer type 找/建对应的 ggml_context 
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
@@ -100,22 +103,24 @@ llama_kv_cache_unified::llama_kv_cache_unified(
         ggml_tensor * k;
         ggml_tensor * v;
 
-        k = ggml_new_tensor_2d(ctx, type_k, n_embd_k_gqa, kv_size);
+        k = ggml_new_tensor_2d(ctx, type_k, n_embd_k_gqa, kv_size); // 创建二维张量。行数是 K/V 的通道数，列数是可缓存的 token 上限 kv_size , 每产生一个新 token，就在当前层的 K/V 张量的下一列写入该 token 的 KV
         v = ggml_new_tensor_2d(ctx, type_v, n_embd_v_gqa, kv_size);
 
-        ggml_format_name(k, "cache_k_l%d", il);
+        ggml_format_name(k, "cache_k_l%d", il); // 给张良起名(), 方便在日志与图可视化时分辩
         ggml_format_name(v, "cache_v_l%d", il);
 
-        map_layer_ids[il] = layers.size();
+        map_layer_ids[il] = layers.size(); // 把{层号, K, V}放进layers，并在 map_layer_ids 里记录。这样后续能按层快速访问对应的 K/V 张量指针
         layers.push_back({ il, k, v });
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto it : ctx_map) {
+    // 作用: 在不同的设备上给 KVCache 分配并初始化显存/内存池
+    for (auto it : ctx_map) { // ctx_map 存的是后端 buffer 类型 --> ggml_context 的映射 std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
         auto * buft = it.first;
         auto * ctx  = it.second;
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        // 为每个设备分配并清零这块 KV 专用 buffer，这块 buffer 的基地址与大小由后端维护（CPU 是一大块内存；CUDA 是一大块显存）。所有该设备的 cache_k cache_v 张量的 data 指针都落在这块区间内
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // 这块 buffer 就是该设备上 KV 的 “大区间”
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
@@ -415,15 +420,16 @@ bool llama_kv_cache_unified::update(llama_context & lctx) {
         }
     }
 
-    if (do_defrag) {
+    if (do_defrag) { // 搭一张专用的 整理搬家 计算图，把 KV 中共零散的块重新压紧；整理完成后，标记“需要重新预留一次”（need_reserve = true）,让主执行路径在新的，紧凑的 KV 布局上重新做内存/显存规划
         LLAMA_LOG_DEBUG("%s: defragmenting KV cache\n", __func__);
 
-        if (defrag_prepare(lctx.graph_max_nodes())) {
-            ggml_backend_sched_reset(sched);
+        // 预检查：能不能在当前允许的最大节点数（graph_max_nodes()）内造出整理所需的图；也可能顺带准备一些中间缓冲/游标。返回 false 就直接放弃本次整理。
+        if (defrag_prepare(lctx.graph_max_nodes())) { // 确认可在当前图容量/资源下构建“整理图”
+            ggml_backend_sched_reset(sched); // 调度器的扫地机器人：每轮开始前把哈希索引和张量拷贝表清空，把已分配标志关掉，为即将到来的 reserve 和执行铺平道路，同时通过 is_reset 避免多次重复清空的浪费
 
             auto * gf = lctx.graph_init();
 
-            auto res = build_graph_defrag(lctx.get_cparams(), lctx.get_ctx_compute(), gf);
+            auto res = build_graph_defrag(lctx.get_cparams(), lctx.get_ctx_compute(), gf); // 往 gf 里塞进一系列搬移/拷贝/索引修正的算子，描述“如何把 KV 从旧布局搬到新布局”
 
             ggml_backend_sched_alloc_graph(sched, gf);
 
@@ -473,17 +479,32 @@ llama_ubatch llama_kv_cache_unified::ubatch_next(llama_sbatch & sbatch, uint32_t
     return sbatch.split_simple(n_ubatch);
 }
 
+/**
+ * @brief 检查是否能为指定数量的令牌找到足够的空闲缓存槽位。
+ 如果找到了空闲槽位，则将这些槽位更新为相应的令牌数据。
+ 使用调试模式打印缓存的状态以供分析。
+ 通过循环和条件判断来优化缓存槽位的分配，避免无效的缓存访问。
+ * 
+ * @param ubatch 
+ * @return true 
+ * @return false 
+ */
 bool llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) {
-    const uint32_t n_tokens = ubatch.n_tokens;
+    const uint32_t n_tokens = ubatch.n_tokens; // 从 ubatch 对象中获取 n_tokens, 即批量中包含的令牌数（tokens）。这些令牌将被缓存
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
+    /**
+         * @brief 如果当前缓存头部 (head) 超过已使用的缓存大小 (used) 加上两倍令牌数 (2 * ubatch.n_tokens)，说明有足够的未使用空间来容纳新的令牌。因此，head 被重置为 0，意味着缓存将从头开始查找空闲位置。
+         * 
+         */
     if (head > used + 2*ubatch.n_tokens) {
         head = 0;
     }
 
     // otherwise, one cell per token.
 
+    // 如果请求的令牌数 (n_tokens) 大于缓存的总大小 (size)，则记录错误日志并返回 false，表示无法为该批次找到足够的空间。
     if (n_tokens > size) {
         LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %d\n", __func__, n_tokens, size);
         return false;
@@ -493,6 +514,7 @@ bool llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) {
 #if FIND_SLOT_DEBUG
     LLAMA_LOG_WARN("begin: n = %5d, used = %5d, head = %5d, n_swa = %5d\n", n, used, head, n_swa);
 
+    // 如果定义了 FIND_SLOT_DEBUG，则打印一些调试信息，包括当前的缓存状态。n、used、head 和 n_swa 是当前缓存的状态信息。
     // for debugging
     {
         std::string ss;
@@ -513,7 +535,7 @@ bool llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) {
 #endif
 
     uint32_t n_tested = 0;
-
+    // 查找空闲槽位的循环。进入一个循环，尝试找到足够的连续空闲槽位来存储令牌。如果从当前的 head 位置开始加上 n_tokens 超出了缓存的总大小 (size)，则将 head 重置为 0，并继续查找。
     while (true) {
         if (head + n_tokens > size) {
             n_tested += size - head;
@@ -521,6 +543,12 @@ bool llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) {
             continue;
         }
 
+        /**
+                 * @brief 对于每个槽位 (cells[head + i])，检查它是否已被占用（pos >= 0 表示槽位已被占用）。如果任何一个槽位已被占用，就更新 head，跳到下一个位置，继续尝试。
+                 如果找到连续的空槽，设置 found = true，跳出循环。
+                 如果已经测试过所有槽位仍未找到足够的空间，则返回 false，表示分配失败。
+                 * 
+                 */
         bool found = true;
         for (uint32_t i = 0; i < n_tokens; i++) {
             if (cells[head + i].pos >= 0) {
@@ -541,6 +569,8 @@ bool llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
+    // 在找到空闲槽位后，首先将该槽位的当前状态保存到 recovery.cells 中，以便如果需要恢复时能够恢复原来的状态。
+    // 然后，将每个槽位的 pos 更新为 ubatch.pos[i]，并将 ubatch.seq_id[i] 中的序列 ID 插入槽位的 seq_id 集合中。
     for (uint32_t i = 0; i < n_tokens; ++i) {
         // remember the original state
         if (recovery.cells.find(head + i) == recovery.cells.end()) {
@@ -554,13 +584,14 @@ bool llama_kv_cache_unified::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
-    used += n_tokens;
+    used += n_tokens; // 更新已经使用的槽位数量
 
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // after enough generations, the benefit from this heuristic disappears
     // if we start defragmenting the cache, the benefit from this will be more important
-    n = std::min(size, std::max(n_pad, GGML_PAD(cell_max(), n_pad)));
+    n = std::min(size, std::max(n_pad, GGML_PAD(cell_max(), n_pad)));  // 缓存优化
 
+    // 如果开启了调试模式，则在函数结束时记录缓存状态日志
 #ifdef FIND_SLOT_DEBUG
     LLAMA_LOG_WARN("end:   n = %5d, used = %5d, head = %5d, n_swa = %5d\n", n, used, head, n_swa);
 #endif
@@ -925,13 +956,19 @@ llm_graph_result_ptr llama_kv_cache_unified::build_graph_shift(
     return res;
 }
 
+// 不直接搬数据，而是在 ggml 里搭建一张图来描述搬家（把 KVCache里稀疏的占用压紧到左侧）,真正执行发生在上层调用
+// ggml_backend_sched_alloc_graph(sched, gf)：给这张“搬家图”分配执行缓冲；
+// lctx.graph_compute(gf, false)：执行图，完成实际拷贝。 
+//
 llm_graph_result_ptr llama_kv_cache_unified::build_graph_defrag(
         const llama_cparams & cparams,
                ggml_context * ctx,
                 ggml_cgraph * gf) const {
     auto res = std::make_unique<llm_graph_result>();
 
-    const auto & ids = defrag_info.ids;
+    const auto & ids = defrag_info.ids; // ids 是压实后的目标位置映射：ids[i] = id 表示“当前第 i 个 KV 槽位要搬到 id 位置”。
+// 当 i == id：这格不用动。当 id == ids.size() 这格是空洞, 不搬。有一个约定：每个元素只会往更小的索引搬，保持相对顺序（稳定压缩）
+// 连续合并：如果 ids[i] == id , id[i + 1] == id + 1,... 说明[i, i + nm) 是一段连续块可以成批搬到 [id, id + nm) ，于是 nm 表示长度
 
 #if 0
     // CPU defrag
@@ -1017,12 +1054,13 @@ llm_graph_result_ptr llama_kv_cache_unified::build_graph_defrag(
             nm++;
         }
 
-        for (const auto & layer : layers) {
+        for (const auto & layer : layers) { // 对每一层的 KV 缓存做同样的搬家
             const uint32_t il = layer.il;
 
             const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
             const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
+            // K 缓存的视图
             ggml_tensor * view_k_src = ggml_view_2d(ctx, layer.k,
                     n_embd_k_gqa, nm,
                     ggml_row_size(layer.k->type, n_embd_k_gqa),
@@ -1033,6 +1071,8 @@ llm_graph_result_ptr llama_kv_cache_unified::build_graph_defrag(
                     ggml_row_size(layer.k->type, n_embd_k_gqa),
                     ggml_row_size(layer.k->type, n_embd_k_gqa*id));
 
+            
+            // V 缓存的视图（两种布局，在是否启用 flash-attention 时布局不同）
             ggml_tensor * view_v_src;
             ggml_tensor * view_v_dst;
 
@@ -1059,18 +1099,18 @@ llm_graph_result_ptr llama_kv_cache_unified::build_graph_defrag(
                         ggml_row_size(layer.v->type, id));
             }
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, view_k_src, view_k_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, view_v_src, view_v_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, view_k_src, view_k_dst)); // ggml_cpy 生成 把 src 复制到 dst 的算子
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, view_v_src, view_v_dst)); // ggml_build_forward_expand 把节点并到图里
         }
 
-        i += nm - 1;
+        i += nm - 1; // 外层 for 还会 i ++ , 这里把 i 一次性跳过这段已处理区间
     }
 
     //LLAMA_LOG_INFO("gf->n_nodes = %d\n", gf->n_nodes);
 #endif
 
     return res;
-}
+} 
 
 bool llama_kv_cache_unified::defrag_prepare(int32_t n_max_nodes) {
     const uint32_t n_layer = layers.size();

@@ -1173,21 +1173,31 @@ void common_batch_clear(struct llama_batch & batch) {
     batch.n_tokens = 0;
 }
 
+/**
+ * @brief 用于构建输入批次的核心函数之一，它将一个新的 token 添加到当前的批次中，以便在后续的解码过程中使用。该函数的作用是一个新的 token 添加到当前的批次中，并更新批次的相关信息。
+ * 
+ * @param batch 
+ * @param id 
+ * @param pos 
+ * @param seq_ids 
+ * @param logits 
+ */
 void common_batch_add(
-                 struct llama_batch & batch,
-                        llama_token   id,
-                          llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-                               bool   logits) {
+                 struct llama_batch & batch, // 当前批次对象，包含了待处理的所有 token
+                        llama_token   id,   // 当前 token 的ID
+                          llama_pos   pos,    // 当前 token 在序列中的位置
+    const std::vector<llama_seq_id> & seq_ids,   // 当前 token 所属的序列 ID 列表
+                               bool   logits) { // 一个 bool 值，表示当前 token 是否用于计算 logits
     GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
 
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
+    // 添加当前 token 的信息
+    batch.token   [batch.n_tokens] = id;  // 将当前 token 的 ID 添加到 token 数组中
+    batch.pos     [batch.n_tokens] = pos;  // 将当前的 token 的位置添加到 pos 数组中
+    batch.n_seq_id[batch.n_tokens] = seq_ids.size();  // 记录当前 token 所属序列的 id 的数量
+    for (size_t i = 0; i < seq_ids.size(); ++i) {  // 将当前 token 所属的所有序列 id 都添加到 seq_id 数组中
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];
     }
-    batch.logits  [batch.n_tokens] = logits;
+    batch.logits  [batch.n_tokens] = logits;  // 将当前 token 是否用于计算的 logits 信息添加到 logits 数组中
 
     batch.n_tokens++;
 }

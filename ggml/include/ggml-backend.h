@@ -26,7 +26,7 @@ extern "C" {
     typedef struct ggml_backend_event * ggml_backend_event_t;
     typedef struct ggml_backend * ggml_backend_t;
     typedef void * ggml_backend_graph_plan_t;
-    typedef struct ggml_backend_reg * ggml_backend_reg_t;
+    typedef struct ggml_backend_reg * ggml_backend_reg_t; // 把后端注册表抽象成 ggml_backend_reg_t
     typedef struct ggml_backend_device * ggml_backend_dev_t;
 
 

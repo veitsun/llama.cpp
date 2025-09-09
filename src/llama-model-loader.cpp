@@ -440,6 +440,8 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
 
+// 解析并索引 GGUF 模型文件（含分片/分卷），把所有张量的“目录”建好，统计基本信息，推断或读取文件类型，并记录后续加载需要的标志位（是否 mmap，是否做张量一致性检查）
+// 真正把权重拷到内存/显存，放到各后端设备，一般发生在后续步骤；这个构造函数干的是“读模型元数据 + 建索引” 的活儿。
 llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
@@ -448,40 +450,44 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     int trace = 0;
-    if (getenv("LLAMA_TRACE")) {
+    if (getenv("LLAMA_TRACE")) { // 按名字在当前进程的环境变量里查找并返回其值的指针；找不到就返回 null
         trace = atoi(getenv("LLAMA_TRACE"));
     }
 
     if (param_overrides_p != nullptr) {
+        // 如果传入了 param_overrides_p, 就把用户提供的键值覆盖到 kv_overrides ,用于修改、覆盖 GGUF 元数据里的一些键值（如：模型超参）。这让加载流程更灵活(比如实验性地改个超参而不用改文件)
         for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
             kv_overrides.insert({std::string(p->key), *p});
         }
     }
 
+    // 用于更底层的张量缓冲区定制，后续阶段才会用到
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
     struct gguf_init_params params = {
-        /*.no_alloc = */ true,
+        /*.no_alloc = */ true, // 仅建立 GGUF / 张量的描述信息与上下文，不把权重数据搬进内存；后续根据设备/后端再做真正分配与映射
         /*.ctx      = */ &ctx,
     };
 
+    // GGUF 是 GGML 系列推理引擎的通用模型文件格式，把张量和元数据存在一起，便于快速，无歧义地加载
     meta.reset(gguf_init_from_file(fname.c_str(), params));
     if (!meta) {
         throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
     }
 
-    get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+    get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false); // 从 GGUF 的 general.architecture 键读出架构字符串（如 "llama"）
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
+    // 记录主文件与上下文，建立统一张量索引
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
 
     // Save tensors data offset of the main file.
     // For subsidiary files, `meta` tensor data offset must not be used,
     // so we build a unified tensors index for weights.
-    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) { // 遍历当前 GGML 上下文里的所有张量描述
         std::string tensor_name = std::string(cur->name);
         // make sure there is no duplicated tensor names
         if (weights_map.find(tensor_name) != weights_map.end()) {
@@ -489,13 +495,18 @@ llama_model_loader::llama_model_loader(
         }
         n_elements += ggml_nelements(cur);
         n_bytes    += ggml_nbytes(cur);
+        // 往 weights_map 塞一条记录，表明这个张量在第 0 号分片，数据来自 meta ， 并保存 ggml_tensor* (有形状，类型，数据偏移等)
         weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
     }
+
+    // 如果是多分片，继续加载其他分片并合并索引
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
     // Load additional GGML contexts
+    // 当模型切分成多个 GGUF 分片的时候，（例如便于分发/部署或超过文件系统单文件限制），这里逐个分片读入“目录信息”，并把所有张量条目合并进统一的 weights_map
     if (n_split > 1) {
+        // 先确认主文件
         // make sure the main file is loaded first
         uint16_t idx = 0;
         const std::string kv_split_no = llm_kv(LLM_KV_SPLIT_NO);
@@ -518,6 +529,7 @@ llama_model_loader::llama_model_loader(
             LLAMA_LOG_INFO("%s: loading additional %d GGUFs\n", __func__, n_split);
         }
 
+        // 从 1 开始，逐个打开分片
         // load other splits
         for (idx = 1; idx < n_split; idx++) {
             const char * fname_split = splits[idx].c_str();
@@ -531,7 +543,7 @@ llama_model_loader::llama_model_loader(
                 throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
             }
 
-            // check idx
+            // check idx 校验该分片的 split_no == idx
             {
                 const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
                 if (kid < 0) {
@@ -546,7 +558,7 @@ llama_model_loader::llama_model_loader(
             files.emplace_back(new llama_file(fname_split, "rb"));
             contexts.emplace_back(ctx);
 
-            // Save tensors data offset info of the shard.
+            // Save tensors data offset info of the shard. 遍历该分片的张量，合并进 weights_map
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
                 std::string tensor_name = std::string(cur->name);
                 // make sure there is no duplicated tensor names
@@ -570,7 +582,7 @@ llama_model_loader::llama_model_loader(
         }
 
         LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
-    }
+    } // 这一步做完，不管模型分了多少片，外部只需要通过 weights_map[“张量名”] 就能找到它在哪个分片，在该分片里的偏移，类型与形状。统一索引是后续高效加载/映射的基石
 
     n_kv      = gguf_get_n_kv(meta.get());
     n_tensors = weights_map.size();
@@ -653,16 +665,17 @@ llama_model_loader::llama_model_loader(
 
         LLAMA_LOG_INFO("%s: Dumping metadata keys/values. Note: KV overrides do not apply in this output.\n", __func__);
 
-        for (int i = 0; i < n_kv; i++) {
-            const char * name           = gguf_get_key(meta.get(), i);
-            const enum gguf_type type   = gguf_get_kv_type(meta.get(), i);
+        // 这段代码是在打印GGUF文件里的元数据，方便开发者调试和查看
+        for (int i = 0; i < n_kv; i++) { // 这里循环遍历元数据里的所有 Key-value 对，键值对，n_kv 就是总数
+            const char * name           = gguf_get_key(meta.get(), i); // 拿到第 i 个键的名字
+            const enum gguf_type type   = gguf_get_kv_type(meta.get(), i); // 取出该键对应值的类型
             const std::string type_name =
                 type == GGUF_TYPE_ARRAY
                 ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(meta.get(), i)), gguf_get_arr_n(meta.get(), i))
-                : gguf_type_name(type);
+                : gguf_type_name(type); // 如果是数组，就打印成 array[element_type,length] 的形式；否则直接打印单个类型名字
 
-            std::string value          = gguf_kv_to_str(meta.get(), i);
-            const size_t MAX_VALUE_LEN = 40;
+            std::string value          = gguf_kv_to_str(meta.get(), i); // 把该键的值打印成字符串（方便打印，不管它原本是 int 还是 float）
+            const size_t MAX_VALUE_LEN = 40; // 为了使日志不长，超过 40 字符的值就截断
             if (value.size() > MAX_VALUE_LEN) {
                 value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
             }

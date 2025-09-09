@@ -149,6 +149,7 @@ struct llama_layer_convnext {
     struct ggml_tensor * gamma = nullptr;
 };
 
+// 一个模型层详细信息的抽象
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -324,11 +325,13 @@ struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
-    std::string name = "n/a";
+    std::string name = "n/a"; // 模型的名称
 
-    llama_hparams hparams = {};
-    llama_vocab   vocab;
+    llama_hparams hparams = {}; // 模型的超参数，包括学习率，隐藏层大小等信息
+    llama_vocab   vocab; // 存储模型的词汇表
 
+    // 模型中使用的张量( ggml_tensor ) ，每个张量对应一个模型的关键部分
+    // 只有在模型推理过程中开始和结尾时候用到？？
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
@@ -350,18 +353,18 @@ struct llama_model {
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 
-    std::vector<llama_layer> layers;
+    std::vector<llama_layer> layers; // 存储模型每个层的详细信息
 
-    llama_model_params params;
+    llama_model_params params; // 模型的参数
 
     // gguf metadata
-    std::unordered_map<std::string, std::string> gguf_kv;
+    std::unordered_map<std::string, std::string> gguf_kv; // metadata，存储与模型相关的元数据，使用键值对的方式存储。从 gguf 文件中取得
 
     // list of devices used in this model
     std::vector<ggml_backend_dev_t> devices;
 
     // for quantize-stats only
-    std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+    std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name; // 存储模型张量以及名称，用于量化统计（通常与优化和量化过程相关）
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
@@ -375,6 +378,7 @@ struct llama_model {
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
 
+    // 下面这些函数提供模型的详细信息，如架构名称，类型名称，模型描述，模型的大小，张量数量，参数数量
     std::string arch_name() const;
     std::string type_name() const;
 
@@ -389,15 +393,17 @@ struct llama_model {
 
     void print_info() const;
 
+    // 张量管理和设备选择
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
-    ggml_backend_buffer_type_t select_buft(int il) const;
+    ggml_backend_buffer_type_t select_buft(int il) const; // 选择指定层的缓冲区类型
 
-    bool has_tensor_overrides() const;
+    bool has_tensor_overrides() const; // 检查是否有张量覆盖
 
-    const struct ggml_tensor * get_tensor(const char * name) const;
+    const struct ggml_tensor * get_tensor(const char * name) const; //  根据张量名称获取张量
 
+    // 这些函数与相对位置编码 （ROPE）有关，计算频率基数，频率比例，获取 ROPE 因子
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
@@ -405,17 +411,17 @@ struct llama_model {
 
     // note: can mutate `cparams`
     // TODO: move this to new llm_arch_model_i interface
-    llama_memory_i * create_memory(const llama_memory_params & params, llama_cparams & cparams) const;
+    llama_memory_i * create_memory(const llama_memory_params & params, llama_cparams & cparams) const; // 创建内存实例
 
-    // TODO: move this to new llm_arch_model_i interface
+    // TODO: move this to new llm_arch_model_i interface 构建计算图
     llm_graph_result_ptr build_graph(
             const llm_graph_params & params,
                        ggml_cgraph * gf,
                     llm_graph_type   type) const;
 
 private:
-    struct impl;
-    std::unique_ptr<impl> pimpl;
+    struct impl; // 将具体实现隐藏在 impl 结构体中，减少头文件依赖和暴露的接口细节
+    std::unique_ptr<impl> pimpl; // 真正沉重且易变的细节（权重映射，后端缓冲，设备分配等）都塞进这个 impl 里
 };
 
 const char * llm_type_name(llm_type type);

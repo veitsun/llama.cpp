@@ -23,13 +23,15 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// 一个负责从文件中读取和解析模型信息的类，构造时传入文件路径，文件分片，是否使用内存映射，是否检查张量，是否使用键值对覆盖和张量缓冲区覆盖等参数
+// 帮助加载大型的模型文件，从模型文件中读取模型的元数据，架构信息，张量权重，超参数，词汇表等，并对模型的数据进行管理
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
 
-        ggml_tensor * tensor;
+        ggml_tensor * tensor; // 指向张量数据的指针
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
@@ -45,6 +47,7 @@ struct llama_model_loader {
     };
 
     // custom comparator to sort weights more nicely by layer
+    // 自定义的比较器，用于按层次顺序对模型权重的名称进行排序。它通过提取权重名称中的 blk.x 部分来确定权重属于哪一层，并根据层号进行排序。这样做的目的是确保权重文件按层的顺序加载
     struct weight_name_comparer {
         bool operator()(const std::string & a, const std::string & b) const {
             int a_layer = -1;
@@ -61,28 +64,28 @@ struct llama_model_loader {
     static const int TENSOR_NOT_REQUIRED = 1;
     static const int TENSOR_DUPLICATED   = 2;
 
-    int n_kv      = 0;
-    int n_tensors = 0;
-    int n_created = 0;
+    int n_kv      = 0; // 键值对的数量
+    int n_tensors = 0; // 模型中张量的数量
+    int n_created = 0; // 已创建的张量的数量
 
-    uint64_t n_elements = 0;
-    size_t   n_bytes    = 0;
+    uint64_t n_elements = 0; // 模型的元素总数
+    size_t   n_bytes    = 0; // 模型文件的字节大小
 
-    bool use_mmap = false;
-    bool check_tensors;
+    bool use_mmap = false;  // 是否使用内存映射来加载文件
+    bool check_tensors; // 是否检查张量数据的有效性
 
-    llama_files files;
-    llama_ftype ftype;
+    llama_files files;  // 存储与模型文件相关的信息（如文件路径）
+    llama_ftype ftype;  // 
     llama_fver  fver;
 
-    llama_mmaps mappings;
+    llama_mmaps mappings; // 一个存储内存映射 mmap 信息的对象，可以提高文件读取效率，避免一次性加载全部数据，适用于大规模模型
 
-    std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
-    std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
+    std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map; // 一个 std::map ，用来存储按层排序的权重张量
+    std::unordered_map<std::string, llama_model_kv_override> kv_overrides;        // 一个映射，表示用户对模型中键值对的覆盖
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
-    gguf_context_ptr meta;
-    std::vector<ggml_context_ptr> contexts;
+    gguf_context_ptr meta;    // 模型的元数据上下文，通常用于保存文件格式和版本等信息
+    std::vector<ggml_context_ptr> contexts;  // 存储与 ggml_context 相关的上下文信息， ggml_context 是用于存储模型张量的上下文
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -91,10 +94,11 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // 构造函数负责初始化 llama_model_loader 对象，主要根据这些参数来配置加载过程：
     llama_model_loader(
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
-        bool use_mmap,
+        const std::string & fname, // 模型文件路径
+        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme 模型文件的分片信息，通常用于大模型拆分加载。
+        bool use_mmap, // 是否使用内存映射加载文件
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);

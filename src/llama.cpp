@@ -83,7 +83,8 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+
+// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback 用于加载深度学习模型，负责从文件中读取模型的架构，超参数，词汇表，统计信息和张量（权重，偏置等） 并根据参数决定是否只加载词汇表。整个过程包括错误处理和时间度量，以确保模型加载过程的正确性和效率
 static int llama_model_load(const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
     // loading time will be recalculated after the first eval, so
     // we take page faults deferred by mmap() into consideration
@@ -93,37 +94,38 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
+        // 加载模型的核心部分，通过传入的模型文件路径( fname ) 和其他参数，创建一个 llama_model_loader 对象，用于管理和加载模型文件
         llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
 
-        model.hparams.vocab_only = params.vocab_only;
+        model.hparams.vocab_only = params.vocab_only; // 如果 vocal_only 为 true，则只加载词汇表，不加载模型的张量数据
 
         try {
-            model.load_arch(ml);
+            model.load_arch(ml); // 加载模型的架构
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
         }
         try {
-            model.load_hparams(ml);
+            model.load_hparams(ml); // 加载模型的超参数
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         try {
-            model.load_vocab(ml);
+            model.load_vocab(ml); // 加载模型的词汇表
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
 
-        model.load_stats(ml);
-        model.print_info();
+        model.load_stats(ml); // 从模型加载器 ml 中加载模型的统计信息（包括模型参数数量，内存使用情况）
+        model.print_info(); // 打印模型详细信息，包括架构，超参数，词汇表和统计信息
 
-        if (params.vocab_only) {
+        if (params.vocab_only) { // 词汇表加载模式
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return 0;
         }
 
-        if (!model.load_tensors(ml)) {
+        if (!model.load_tensors(ml)) { // 如果不在词汇表加载模式下，则加载模型的张量数据。load_tensors 负责加载模型的权重，偏置等张量
             return -2;
         }
     } catch (const std::exception & err) {
@@ -138,7 +140,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         const std::string & path_model,
         std::vector<std::string> & splits,
         struct llama_model_params params) {
-    ggml_time_init();
+    ggml_time_init(); // 初始化模型跟踪，用于记录加载模型的时间
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
@@ -162,14 +164,15 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    llama_model * model = new llama_model(params);
+    llama_model * model = new llama_model(params); // 创建一个新的 llama_model 对象，并将参数传递给它进行初始化
 
-    // create list of devices to use with this model
+    // create list of devices to use with this model 根据用户传入的设备参数或系统可用的设备，设置要用于模型的设备（包括 CPU，GPU 等）
     if (params.devices) {
         for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
             model->devices.push_back(*dev);
         }
     } else {
+        // 关注到了 RPC 服务器的处理逻辑
         std::vector<ggml_backend_dev_t> rpc_servers;
         // use all available devices
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -204,16 +207,18 @@ static struct llama_model * llama_model_load_from_file_impl(
             return nullptr;
         }
         ggml_backend_dev_t main_gpu = model->devices[params.main_gpu];
-        model->devices.clear();
+        model->devices.clear(); // 单 GPU 模式， model->devices 里只有 main_gpu
         model->devices.push_back(main_gpu);
     }
 
+    // 遍历所有设备并输出每个设备的空闲内存信息
     for (auto * dev : model->devices) {
         size_t free, total; // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);
         LLAMA_LOG_INFO("%s: using device %s (%s) - %zu MiB free\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), free/1024/1024);
     }
 
+    // 加载模型文件，如果失败，输出相应的错误信息并释放资源
     const int status = llama_model_load(path_model, splits, *model, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
@@ -227,7 +232,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
-    return model;
+    return model; // 返回加载的模型的指针
 }
 
 // deprecated

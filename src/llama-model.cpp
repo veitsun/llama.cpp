@@ -372,17 +372,19 @@ struct llama_model::impl {
     std::string desc_str;
 
     // model memory mapped files
-    llama_mmaps mappings;
+    llama_mmaps mappings; // 模型权重的内存映射文件（mmap）；避免一次性把大权重读进内存
+    // 把 GGUF 权重内存映射到进程地址空间，而不是一次性读入用户缓冲；这样可以按需分页载入，加速启动，并节省常驻内存。
+    // linux 的 mmap 语义是把文件页直接映射进进程虚存，真正的物理页在首次访问时按页载入；
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
-    llama_mlocks mlock_mmaps;
+    llama_mlocks mlock_mmaps; // 这个和 mlock_bufs 作用是把关键页 mlock 住，尽量不被换出（降低抖动）
 
     // contexts where the model tensors metadata is stored
-    std::vector<ggml_context_ptr> ctxs;
+    std::vector<ggml_context_ptr> ctxs; // 若干 GGML 上下文，主要存张量的元数据与计算图相关结构。在 llama.cpp 中，会把张量的元数据与张量的实际数据分离管理。
 
     // the model memory buffers for the tensor data
-    std::vector<ggml_backend_buffer_ptr> bufs;
+    std::vector<ggml_backend_buffer_ptr> bufs; // 后端缓冲指针数组，真正存放张量数据的内存
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -396,7 +398,7 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
-    bool has_tensor_overrides;
+    bool has_tensor_overrides; // 是否启用张量放置/缓冲类型覆盖、近期有改动允许覆盖模型张量默认的缓冲类型/放置策略（例如强制某些张量用特定 buffer type），这个标志用来记录是否存在覆盖信息
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -4207,16 +4209,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, buf_map);
     }
 
+    // 只有当前编译/运行环境支持 GPU offload 才会进入这个逻辑，否则全部用 CPU 跑
     if (llama_supports_gpu_offload()) {
+        // n_gpu_layers 用户请求的要放到 GPU 的层数， hparams.n_layer 模型本身的总层数
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
 
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_gpu);
+        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_gpu); // 打印日志，有多少层被放到 GPU
         if (n_gpu_layers > (int) hparams.n_layer) {
             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
         }
 
-        const int max_backend_supported_layers = hparams.n_layer + 1;
-        const int max_offloadable_layers       = hparams.n_layer + 1;
+        const int max_backend_supported_layers = hparams.n_layer + 1; // 后端（GPU/CPU 混合计算逻辑）最多支持多少层
+        const int max_offloadable_layers       = hparams.n_layer + 1; // 最多能 offloadable 的层数
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
@@ -4228,8 +4232,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // populate tensors_by_name
     for (auto & ctx : pimpl->ctxs) {
+        // 内存循环用 ggml_get_first_tensor和 ggml_get_next_tensor 来遍历某个 context 下的所有张量
         for (auto * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
-            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur); // 取出当前张量的名字和指针，放进 tensors_by_name （std::vector<std::pair<std::string, struct ggml_tensor *>>）
+            // 这样后面加载文件时可以通过名字快速定位到对应的张量对象
         }
     }
 
@@ -4237,14 +4243,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     for (auto & it : ctx_bufs) {
         ggml_context * ctx = it.first;
         auto & bufs = it.second;
+        // load_all_data 会把模型文件里的原始权重拷贝（或映射）到对应 context 的张量内存
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
-        }
+        } 
     }
 
+    // 如果采用 mmap 内存映射，方式加载权重， ml.mappings 里会有映射对象（文件描述符/地址区间）
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+            pimpl->mappings.emplace_back(std::move(mapping)); // 这里把这些映射句柄移入 pimpl->mapping ，确保它们在模型生命周期内一直有效（只要映射活着，张量的数据就可用）
         }
     }
 
@@ -13184,7 +13192,16 @@ struct llm_build_bailingmoe : public llm_graph_context {
     }
 };
 
+/**
+ * @brief KV、状态缓存工厂：根据模型架构（arch）与上下文参数 cparams，内存参数 params，挑选并构造合适的记忆实现（实现类都继承自 llama_memory_i）用于保存推理过程中产生的 KV 缓存或循环状态。
+ * 
+ * @param params 
+ * @param cparams 
+ * @return llama_memory_i* 
+ */
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
+    // 这里的 create_memory 只是创建一个记忆管理器对象，并做一些形状/对齐初始化。这一步不做大缓冲的设备分配
+    // 为推理准备记忆体管理器，根据模型架构与参数挑选并构造 KV / 状态缓存的实现类；它不加载模型权重，也不做大块设备内存分配（权重映射/分配 走的是模型加载流程 llama_load_model_from_file()）
     llama_memory_i * res;
 
     switch (arch) {
@@ -13201,6 +13218,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_RWKV6QWEN2:
         case LLM_ARCH_RWKV7:
         case LLM_ARCH_ARWKV7:
+        // 这些状态空间/循环类型，并不使用“注意力式”的 KV，而是维护每层的循环状态。因此工厂返回 llama_kv_cache_recurrent
             {
                 res = new llama_kv_cache_recurrent(
                         *this,
@@ -13211,10 +13229,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         cparams.n_seq_max);
             } break;
         default:
+        // 其余 transformer 统一 KV
             {
+                // 在创建统一 KV 前，先根据后端/布局计算对齐粒度，把 n_ctx 向上补齐到合适的倍数，避免越界与提升访存效率
                 const auto padding = llama_kv_cache_unified::get_padding(cparams);
-
                 cparams.n_ctx = GGML_PAD(cparams.n_ctx, padding);
+
 
                 LLAMA_LOG_DEBUG("%s: n_ctx = %u (padded)\n", __func__, cparams.n_ctx);
 
@@ -13225,16 +13245,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             *this,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            params.swa_full,
-                            cparams.n_ctx,
-                            cparams.n_seq_max,
-                            cparams.n_batch,
-                            padding);
+                            !cparams.flash_attn, // 根据是否启用 flash_attention 调整内部存储/转置策略
+                            cparams.offload_kqv, // 是否将 KQV 的计算或缓存放到后端设备
+                            params.swa_full, // 是否禁用 iSWA 的内存优化，用全量 SWA（更占内存，某些功能兼容性更好）
+                            cparams.n_ctx, // 上下文最大长度
+                            cparams.n_seq_max, // 并行序列上限
+                            cparams.n_batch, // 批大小
+                            padding); // 对齐粒度
                 } else {
                     GGML_ASSERT(!hparams.is_swa_any());
 
+                    // 统一 KV 的主实现，支持多序列共享一块大缓存，分配/回收，以及在运行中对碎片进行缓解（defrag/优化）。统一 KV 是为了支持批量解码和并发会话而引入的；随着长时间运行与不同序列长度交错使用，KV会发生碎片化，社区也围绕它持续迭代。
                     res = new llama_kv_cache_unified(
                             *this,
                             nullptr,
@@ -13536,7 +13557,7 @@ llm_graph_result_ptr llama_model::build_graph(
 // interface implementation
 //
 
-llama_model_params llama_model_default_params() {
+llama_model_params  llama_model_default_params() {
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,

@@ -382,7 +382,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return cur_p.data[cur_p.selected].id;
 }
 
+/**
+ * @brief 会在一串候选“草稿 token” （draft） 的基础上，逐步从目标模型分布采样，每采到一个就接受（更新采样器与语法约束的状态），并于对应的草稿 token 对比
+    - 如果当前采样与草稿一致，继续下一步
+    - 如果第一次出现不一致，就立刻停下并返回到目前为止接受的 token
+    - 如果全部草稿都一致，再额外采一个新 token 并返回
+ * 
+ * @param gsmpl 
+ * @param ctx 
+ * @param idxs 
+ * @param draft 
+ * @param grammar_first 
+ * @return std::vector<llama_token> 
+ */
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+    // 前置条件检查，idxs 必须比 draft 多一个槽位，原因是“一旦草稿全部都被证实一致，还要多采一个新的 token”
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -390,18 +404,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        // 用 idxs[i] 个槽位的 logits 做一次采样（底层会 set_logits(ctx, idxs[i])）
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        common_sampler_accept(gsmpl, id, true);
+        common_sampler_accept(gsmpl, id, true); // 立刻 accept 这个 token （推进语法与采样器状态）
 
-        result.push_back(id);
+        result.push_back(id); // 把它放入返回序列
 
-        if (draft[i] != id) {
+        if (draft[i] != id) { // 与 draft[i] 对比，若不相等说明“目标分布 与草稿分布在第 i 步产生分歧”，立即退出循环。这是推测式解码里“遇到分歧就停”的标准做法。头文件对“若采样不同就停止并返回至今接受的 token”的描述与此一致
             break;
         }
     }
 
-    if (i == draft.size()) {
+    if (i == draft.size()) { // 只有当所有草稿都匹配，（循环没有被打断）时，才会多采一个额外 token （用 idxs 的最后一个槽位）并接受它。这样返回序列就包含“草稿里那一段全通过 + 新扩展一步”
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         common_sampler_accept(gsmpl, id, true);

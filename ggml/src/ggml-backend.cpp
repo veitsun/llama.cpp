@@ -641,9 +641,9 @@ struct ggml_backend_sched {
     ggml_gallocr_t galloc;
 
     // hash map of the nodes in the graph
-    struct ggml_hash_set  hash_set;
+    struct ggml_hash_set  hash_set; // 一个哈希集合，用于对张量/节点做去重与索引，（张量指针/描述映射到一个整型 id）
     int                 * hv_tensor_backend_ids; // [hash_set.size]
-    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]  指向每个张量在各后端的拷贝
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1534,15 +1534,16 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset state for the next run
-    if (!sched->is_reset) {
-        ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-        sched->is_reset = true;
+    if (!sched->is_reset) { // 只有本轮还没有重置过，才进行昂贵的清空操作
+        ggml_hash_set_reset(&sched->hash_set); // hash_set
+        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0])); // 保存每个哈希槽当前绑定的后端 id，置 -1 表示“未绑定/未知”。
+        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *)); // sched->hv_tensor_copies：长度为 hash_set.size * n_backends * n_copies 的指针数组，指向每个张量在各后端的拷贝（可能是不同显卡/不同复制通道）。置 0（空指针）表示“没有可用拷贝/未缓存”。
+        sched->is_reset = true; // 是否已经做过本轮的重置。有了它，就不会在同一轮里重复大规模 memset
     }
-    sched->is_alloc = false;
+    sched->is_alloc = false; // 是否已经为当前图分配/预留了计算缓冲。进入新一轮前要设为 false。无论是否做了清零，这里都把“已分配缓冲”标志关掉：强制下一步的 reserve/alloc 重新跑一遍。这保证了“新图/新形状/新 KV 状态”的内存规划是新鲜的。
 }
 
+// 根据本轮的图做内存/显存预留
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
@@ -1554,13 +1555,15 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         return false;
     }
 
-    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_reset(sched); // 清空状态，关掉已分配标志
 
     return true;
 }
 
+
+// 把一张具体的 ggml 计算图交给调度器，并为它做好内存/显存分配与执行切片的入口
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs); // 调度器内部的 哈希表/索引池 （用来登记张量映射与驻留拷贝） 要有足够的槽位，能够容纳这张图的所有中间节点 + 叶子节点（输入 / 常量）
 
     ggml_backend_sched_split_graph(sched, graph);
 
@@ -1581,16 +1584,22 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // 如果调度器此刻既没有处于 reset 状态，又没有完成分配，就先 reset
+    // 上一轮计算可能在中途退出或者留下脏状态。这里保证：要么已经完成了本轮的图内存分配（is_alloc） ，要么先把状态清空（reset），避免用旧的 split/缓冲规划去跑新的图
+    // 调度器会把图切分并把张量挂接到后端缓冲；这些绑定在下一次复用时可能失效甚至冲突，所以常见用法是一次计算→同步→reset
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
 
+    // 如果还没有为计算图做内存分配/绑定，调用 alloc_graph, alloc_graph 会修改计算图，把每个张量的 buffer/data 指向调度器管理的后端缓冲；这让图能直接在对应设备上运行，但也意味着图与本轮调度器的缓冲绑定了。
     if (!sched->is_alloc) {
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
 
+    // 真正的“算”从这里开始：让调度器按后端能力把图切成多个 split，为跨后端的张量自动插入拷贝，在每个 split 所属后端上异步提交子图计算。
+    // 外层通常在提交后调用 ggml_backend_sched_synchronize() 等待完成，再 reset 开启下一轮（例如每 token 一次的生成循环）
     return ggml_backend_sched_compute_splits(sched);
 }
 

@@ -134,25 +134,35 @@ bool common_speculative_are_compatible(
     return true;
 }
 
+/**
+ * @brief 这段代码实现了推测式解码中草稿生成的关键部分。它通过草稿模型生成一定数量的草稿 token，这些 token 可以作为候选项供目标模型进一步验证和采样。该过程的核心目的是利用草稿模型快速生成可能的 token 序列，减少目标模型的计算负担，从而提高生成效率。
+ * 
+ * @param spec 
+ * @param params 
+ * @param prompt_tgt 
+ * @param id_last 
+ * @return llama_tokens 
+ */
 llama_tokens common_speculative_gen_draft(
         struct common_speculative * spec,
         struct common_speculative_params params,
         const llama_tokens & prompt_tgt,
         llama_token id_last) {
-    auto & batch  = spec->batch;
-    auto & ctx    = spec->ctx;
-    auto & smpl   = spec->smpl;
-    auto & prompt = spec->prompt;
+    auto & batch  = spec->batch; // llama_batch_init(llama_n_batch(ctx_dft), 0, 1)
+    auto & ctx    = spec->ctx; // ctx_dft
+    auto & smpl   = spec->smpl; //  nullptr 
+    auto & prompt = spec->prompt; // {}
 
     int reuse_i = 0;
     int reuse_n = 0;
 
-    const int n_ctx = llama_n_ctx(ctx) - params.n_draft;
+    const int n_ctx = llama_n_ctx(ctx) - params.n_draft; // 计算草稿模型上下文的可用大小。草稿模型的上下文是通过 llama_n_ctx(ctx) 获取的，减去 n_draft 后得到剩余的上下文容量。n_draft 是推测式解码中希望生成的最大草稿 token 数量。
 
-    const int i_start = std::max<int>(0, (int) prompt_tgt.size() - n_ctx);
+    const int i_start = std::max<int>(0, (int) prompt_tgt.size() - n_ctx); // 计算在 prompt_tgt 中，草稿模型能够使用的起始位置。通过 i_start 确定草稿模型能够复用的上下文范围。
 
     // reuse as much as possible from the old draft context
     // ideally, the draft context should be as big as the target context and we will always reuse the entire prompt
+    // 查找可以复用的历史上下文。通过比较 prompt （之前生成的 tokens） 和 prompt_tgt （当前输入的 tokens） 之间的匹配部分，来决定从哪里开始复用已有的历史信息
     for (int i = 0; i < (int) prompt.size(); ++i) {
         int cur = 0;
         while (i_start + cur < (int) prompt_tgt.size() &&
@@ -161,6 +171,7 @@ llama_tokens common_speculative_gen_draft(
             cur++;
         }
 
+        // 复用条件：如果匹配的长度 cur 大于等于 n_reuse （表示已经足够的匹配长度），并且当前的复用长度比之前的最大复用长度 reuse_n 更长，则选择该部分作为复用区域
         if ((cur >= params.n_reuse || n_ctx >= (int) prompt_tgt.size()) && cur > reuse_n) {
             reuse_i = i;
             reuse_n = cur;
@@ -208,34 +219,34 @@ llama_tokens common_speculative_gen_draft(
     // prepare a batch to evaluate any new tokens in the prompt
     common_batch_clear(batch);
 
-    for (size_t i = i_start + reuse_n; i < prompt_tgt.size(); ++i) {
+    for (size_t i = i_start + reuse_n; i < prompt_tgt.size(); ++i) { // ：将当前的 token 添加到批次中，i - i_start 表示当前 token 在上下文中的位置，{ 0 } 是序列 ID，false 表示这是一个草稿 token。
         //LOG_DBG("i = %d, i_start = %d, reuse_n = %d, i - i_start = %d, id = %6d\n", i, i_start, reuse_n, i - i_start, prompt_tgt[i]);
         common_batch_add(batch, prompt_tgt[i], i - i_start, { 0 }, false);
 
-        prompt.push_back(prompt_tgt[i]);
+        prompt.push_back(prompt_tgt[i]); // 将当前的 token 添加到上下文中，为下一次解码做准备。
     }
 
     // we should rarely end-up here during normal decoding
     if (batch.n_tokens > 0) {
         //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
 
-        llama_decode(ctx, batch);
+        llama_decode(ctx, batch);  // 对构建的输入批次进行解码，生成预测的 token
     }
 
     const llama_pos n_past = prompt.size();
 
     LOG_DBG("%s: n_past = %d\n", __func__, n_past);
 
-    common_batch_clear(batch);
-    common_batch_add  (batch, id_last, n_past, { 0 }, true);
+    common_batch_clear(batch); // 清空当前批次数据
+    common_batch_add  (batch, id_last, n_past, { 0 }, true); // 将最后一个 token（id_last）添加到批次中，n_past 表示当前 token 在上下文中的位置，{ 0 } 是序列 ID，true 表示这是一个目标 token。
 
-    prompt.push_back(id_last);
+    prompt.push_back(id_last); // 将最后一个 token 添加到上下文中，为下一次解码做准备
 
     //LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx, prompt).c_str());
 
-    llama_decode(ctx, batch);
+    llama_decode(ctx, batch); // 对构建的输入批次进行解码，生成预测的 token
 
-    common_sampler_reset(smpl);
+    common_sampler_reset(smpl); // 重置采样器状态，为下一轮采样做准备
 
     // sample n_draft tokens from the draft model
     for (int i = 0; i < params.n_draft; ++i) {

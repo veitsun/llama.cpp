@@ -2562,6 +2562,7 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
 
     // copy piece chars to output text buffer
     // skip up to 'lstrip' leading spaces before copying
+    // 用于将标记的字符数据复制到缓冲区 buf 中。首先，它会跳过前 lstrip 个空格（如果存在），然后将剩余的字符数据复制到 buf 中。如果剩余的字符数据太大，无法完全复制到buf 中，它会返回一个负值，表示错误
     auto _try_copy = [=] (const char * token, size_t size) -> int32_t {
         for (int32_t i = 0; i < lstrip && size && *token == ' '; ++i) {
             token++;
@@ -2574,7 +2575,7 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
         return (int32_t) size;
     };
 
-    // if we have a cache - use it
+    // if we have a cache - use it 如果存在缓存，并且缓存中有当前 token 的数据，函数会直接从缓存中获取数据，并复制到缓冲区中
     {
         const auto & cache = cache_token_to_piece;
 
@@ -3318,12 +3319,12 @@ int32_t llama_tokenize(
 }
 
 int32_t llama_token_to_piece(
-    const struct llama_vocab * vocab,
-                 llama_token   token,
-                        char * buf,
-                     int32_t   length,
-                     int32_t   lstrip,
-                        bool   special) {
+    const struct llama_vocab * vocab,  // 指向词汇表结构体的指针，它包含所有的词汇表数据
+                 llama_token   token,  // 输入的 llama_token ,即需要转换的标记
+                        char * buf,    // 字符数组，结果将被写入该数组
+                     int32_t   length, // 缓冲区的长度，限制了可以写入缓冲区的最大字节数
+                     int32_t   lstrip,   // 指定在复制文本之前，是否需要丢弃（跳过）前导空格的数量
+                        bool   special) { // special 如果为 true ，则会特殊处理一些标记（比如空格符，用户定义的标记等）
     return vocab->token_to_piece(token, buf, length, lstrip, special);
 }
 

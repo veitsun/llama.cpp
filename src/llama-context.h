@@ -232,7 +232,7 @@ private:
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 
-    ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched; // 后端调度器对象
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

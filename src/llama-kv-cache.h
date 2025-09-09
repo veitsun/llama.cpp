@@ -18,6 +18,10 @@ struct llama_sbatch;
 struct llama_model;
 struct llama_context;
 
+/**
+ * @brief 它描述了 llama.cpp 里 KV 缓存（注意力的 K/V 张量历史） “该具备的一组行为；具体怎么存，怎么挪，怎么碎片整理，由不同实现类去完成”。
+ * 
+ */
 struct llama_kv_cache : public llama_memory_i {
     virtual ~llama_kv_cache() = default;
 

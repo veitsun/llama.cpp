@@ -190,6 +190,15 @@ llama_ubatch llama_sbatch::split_seq(size_t n_ubatch) {
     return ubatch;
 }
 
+
+/**
+ * @brief 把一锅“混合了多条序列的 token”的 llama_batch，重排→分段→归类，做成后续易于下发给底层算子的“微批（ubatch）原料表”。之所以要这么折腾，是因为 llama.cpp 的批处理模型允许同一批里每个 token 有各自的序列 ID 集合与位置，从而支持“连续批处理”和“共享前缀复用”。这些能力都建立在“序列 ID（seq_id）+ 位置（pos）决定注意力掩码”的机制上
+ * 
+ * @param batch 
+ * @param n_embd 
+ * @param simple_split 
+ * @param logits_all 
+ */
 llama_sbatch::llama_sbatch(const llama_batch & batch, size_t n_embd, bool simple_split, bool logits_all) {
     GGML_ASSERT(batch.n_tokens >= 0);
     this->batch = &batch;
@@ -279,9 +288,11 @@ llama_sbatch::llama_sbatch(const llama_batch & batch, size_t n_embd, bool simple
 }
 
 llama_batch_allocr::llama_batch_allocr(struct llama_batch in_batch, llama_pos p0) {
+    // 这段构造函数接过一个 llama_batch ，检查几个关键指针是否为空；若为空，就在内部分配并填充默认值，把缺的都补上，然后把batch里的指针指向这些内部缓冲区。
     batch = in_batch;
     GGML_ASSERT(batch.n_tokens > 0);
-    if (!batch.pos) {
+    if (!batch.pos) { // 如果没有提供 pos，就用 p0 ,p0 + 1 、、、连续填充每个 token 的位置。并把 batch.pos 指向内部 pos 缓冲。
+        // 为什么要位置：因为每个 token 都有自己的位置和序列 id，这两者共同决定它会跟哪部分 KV 交互。连续位置就是这是一段接在一起的序列
         assert(p0 >= 0);
         pos.resize(batch.n_tokens);
         for (int32_t i = 0; i < batch.n_tokens; i++) {
@@ -290,28 +301,29 @@ llama_batch_allocr::llama_batch_allocr(struct llama_batch in_batch, llama_pos p0
         batch.pos = pos.data();
     }
     if (!batch.n_seq_id) {
+        // n_seq_id 每个 token 关联了多少个 sequence id
         n_seq_id.resize(batch.n_tokens);
         for (int32_t i = 0; i < batch.n_tokens; i++) {
-            n_seq_id[i] = seq_id_0.size();
+            n_seq_id[i] = seq_id_0.size(); // 默认设置每个 token 都属于一个序列（即每个 token 属于一个序列。llama_batch 允许“一个 token 归属于多个 seq”，因此这里的类型是“每 token 一个计数”）
         }
         batch.n_seq_id = n_seq_id.data();
     }
-    if (!batch.seq_id) {
-        seq_id.resize(batch.n_tokens + 1);
+    if (!batch.seq_id) { // seq_id 这里是二级指针，每个 token 指向一段它自身的 seq_id 数组
+        seq_id.resize(batch.n_tokens + 1); // 分配一个长度是 n_tokens + 1 的指针数组，最后一个置 NULL 当哨兵
         seq_id[batch.n_tokens] = NULL;
-        for (int32_t i = 0; i < batch.n_tokens; i++) {
+        for (int32_t i = 0; i < batch.n_tokens; i++) { // 让每个 token 的 seq_id[i] 都指向同一段默认的 seq_id_0 ，等价于所有 token 都属于同一个默认序列（通常是 0）
             seq_id[i] = seq_id_0.data();
         }
         batch.seq_id = seq_id.data();
     }
-    if (!batch.logits) {
+    if (!batch.logits) { // 若没有提供 logits 标志数组，就默认只给最后一个 token 算 logits。 这和项目里的实践一致：如果你不指定 logits_all ，通常只需要最后一步的分布用来采样。 llama_get_logits 的行为也基于这组布尔位：只有 logits[i] != 0 的 token 才会在输出的 logits 矩阵里出现，顺序与 batch 内出现的顺序一致
         logits.resize(batch.n_tokens);
-        logits[logits.size() - 1] = true;
+        logits[logits.size() - 1] = true; // 只有最后一步的分布需要用来采样
         batch.logits = logits.data();
     }
 }
 
-//
+///
 // interface implementation
 //
 

@@ -188,6 +188,7 @@ extern "C" {
     // Backend (reg)
     //
 
+    // 这是系统的 "后端注册表"
     struct ggml_backend_reg_i {
         const char * (*get_name)(ggml_backend_reg_t reg);
 
@@ -197,7 +198,8 @@ extern "C" {
 
         // (optional) get a pointer to a function in the backend
         // backends can add custom functions that are not part of the standard ggml-backend interface
-        void * (*get_proc_address)(ggml_backend_reg_t reg, const char * name);
+        void * (*get_proc_address)(ggml_backend_reg_t reg, const char * name); // 这是一个关键钩子
+        // 意思是给我一个函数名，我就可以把对应函数的地址返回给你
     };
 
     struct ggml_backend_reg {

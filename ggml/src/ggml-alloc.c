@@ -984,15 +984,23 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
     return true;
 }
 
+/**
+ * @brief 把 ctx 里的未分配张量（且不是 view）按指定后端缓冲类型 buft 成批打包到一批后端 buffer 中，并把每个张量的 buffer/data 指针挂到相应位置。必要时会因为设备上单个 buffer 的上限拆分成多个 buffer，最后返回一个 buffer（或多缓冲包装器）
+ * 
+ * @param ctx 
+ * @param buft 
+ * @return ggml_backend_buffer_t 
+ */
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
-    GGML_ASSERT(ggml_get_no_alloc(ctx) == true);
+    GGML_ASSERT(ggml_get_no_alloc(ctx) == true); // 也就是说此 ggml_context 里只有张量元信息，还没有分配/绑定真实数据区，这正是"让后端来分配内存" 的工作流前提
 
-    size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t alignment = ggml_backend_buft_get_alignment(buft); // 从 buft 取出对齐粒度 和 单个 buffer 最大尺寸
     size_t max_size = ggml_backend_buft_get_max_size(buft);
 
     ggml_backend_buffer_t * buffers = NULL;
     size_t n_buffers = 0;
 
+    // 遍历张量，对每个还没有分配，且不是 view 的张量，计算它在该后端下需要的字节数（可能大于裸 nbytes），由后端 get_alloc_size 决定，然后按对齐累加，凑够或超过上限就开一个新 buffer
     size_t cur_buf_size = 0;
     struct ggml_tensor * first = ggml_get_first_tensor(ctx);
     for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -1003,6 +1011,7 @@ ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_conte
 
         if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
             // allocate tensors in the current buffer
+            // 一段段区间交给 alloc_tensor_range 去落实，给该区间张量申请一个后端 buffer，并依次调用底层分配函数，把每个张量的 buffer/data 指针挂到相应位置。完成后，内存已分配，但数据还没有拷进去；下一步通常需要 ggml_backend_tensor_set 来装载数据
             if (!alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
                 return NULL;
             }
@@ -1027,6 +1036,7 @@ ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_conte
         return NULL;
     }
 
+    // 如果只用到一个 buffer，就直接返回它；如果拆成多个，就用 muti-buffer 聚合成一个“虚拟buffer”返回（对调用者透明）
     ggml_backend_buffer_t buffer;
     if (n_buffers == 1) {
         buffer = buffers[0];

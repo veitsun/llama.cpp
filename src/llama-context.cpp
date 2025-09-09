@@ -14,17 +14,20 @@
 // llama_context
 //
 
+// 把模型与运行参数落地为一次可用的推理上下文，并把后续推理所需的后端，内存，调度器，图以及缓冲区都准备好，从而在生成时尽可能避免临时分配和兼容性问题
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model) {
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    // 把模型侧的计时信息拷贝过来（用于后续性能统计）
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
+    // 把调用者传进来的 params 转成内部使用的 cparams ， 并做一系列未指定则用模型默认/训练值 处理
     const auto & hparams = model.hparams;
-
+ 
     cparams.n_seq_max        = std::max(1u, params.n_seq_max);
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
@@ -94,9 +97,9 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    cparams.op_offload = params.op_offload;
+    cparams.op_offload = params.op_offload; // 算子异地执行
 
-    const uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max;
+    const uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max; // 多序列并发时等分上下文窗口
 
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
@@ -118,14 +121,16 @@ llama_context::llama_context(
                 __func__, n_ctx_per_seq, hparams.n_ctx_train);
     }
 
+    // 若非仅词表模式，初始化各类后端
     if (!hparams.vocab_only) {
         // GPU backends
-        for (auto * dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        // 对每个设备 ggml_backend_dev_init , 失败抛异常，成功放入 backends
+        for (auto * dev : model.devices) { // 遍历 model.devices 里的每一个设备句柄 （ggml_backend_dev_t） 。在 GGML 里，ggml_backend_dev_t 本质上就是指向后端设备的指针类型
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr); // 把每个设备实例化成一个可用的后端。失败就抛异常，成功就收集起来。
             if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev))); // 如果初始化失败，直接抛异常，并打印哪个设备失败
             }
-            backends.emplace_back(backend);
+            backends.emplace_back(backend); // 前面 ggml_backend_dev_init 函数返回的值就是可用的后端句柄，成功的话就把创建好的后端放进 backends 容器中，后面执行计算/分配张量都会用到这些后端
         }
 
         // add ACCEL backends (such as BLAS)
@@ -140,26 +145,28 @@ llama_context::llama_context(
             }
         }
 
-        // add CPU backend
+        // add CPU backend 必须要有一个 CPU 后端（兜底，协调），初始化失败则抛异常，并 push 到 backends
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
 
-        // create a list of the set_n_threads functions in the backends
+        // create a list of the set_n_threads functions in the backends 收集 set_n_threads ：对每个后端，若能拿到 ggml_backend_set_n_threads 函数指针，就记下来（后续可以动态调线程）
+        // 从已经初始化的后端中，找出是否可以动态设置线程数的函数指针，然后把这些函数收集起来，方便后续调用
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (reg) {
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-                if (ggml_backend_set_n_threads_fn) {
+                if (ggml_backend_set_n_threads_fn) { // 如果函数指针有效，就放进 set_n_threads_fns 容器，记下这个后端和它设置线程数的函数指针
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
             }
         }
+        // GGML 把后端，设备，注册表设计得像一个棋盘上的棋子，职责分明。 register_backend 注册所有后端， get_proc_address 把可选能力暴露给调用方
 
-        llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
+        llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data); // 支持外部中止长时间推理
 
         // graph outputs buffer
         {
@@ -182,20 +189,24 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        // 初始化记忆模块，把注意力的 KV 历史存储形式，量化方式，是否 swa （滑动窗口注意力）等落实好，是增量解码的核心数据结构
+        memory.reset(model.create_memory(params_mem, cparams)); // reset(p) 删除当前对象，memory 再接管原始指针 p 的所有权
     }
 
-    // init backends
+    // init backends 初始化调度器，与计算元数据缓冲
+    // 下面这段代码：枚举后端 -> 预备图/元数据缓冲 -> 决定是否开启流水线并行并创建调度器
     if (!hparams.vocab_only) {
-        LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
+        LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__); 
 
         backend_buft.clear();
         backend_ptrs.clear();
 
         for (auto & backend : backends) {
+            // 对每个后端取默认的 buffer_type ，若有 GPU 设备， CPU 侧有限用第一个设备的 host buffer 作为 CPU 缓冲
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
+            // 如果当前是 CPU 后端且存在 GPU 设备，就把 CPU 的 buffer type 改成设备的 host buffer type。 host buffer 是配合设备传输优化的主机侧内存类型，用它给 CPU 侧的中间状态做落脚点，能更快地和 GPU 互拷。
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 auto * dev = model.devices[0];
@@ -205,6 +216,7 @@ llama_context::llama_context(
                 }
             }
 
+            // 把挑好的 buffer type 和后端指针分别塞进 backend_buft、backend_ptrs 数组，后面创建调度器会用到。调度器会基于 后端 + buffer type 来决定张量驻留与算子派发
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
         }
@@ -216,10 +228,22 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
         // buffer used to store the computation graph and the tensor meta data
+        // 一次性预分配一块连续内存（CPU端），专门用来放计算图对象 + 张量元数据（metadata）
+        // 不是权重数据，也不是中间激活的数值，只是描述信息（结构体，指针，列表等）。这样做能避免构图时的零碎分配，提升稳定性与性能
+        // 把 buf_compute_meta 的容量改到足够容纳 max_nodes 个张量描述 + 一个计算图对象自身的开销之和
+        // ggml_tensor_overhead() 返回单个 ggml 张量描述需要的字节数（相当于 struct ggml_tensor 以及必要对齐/附加的大小，不含张量的数据区）
+        // ggml_graph_overhead_custom(max_nodes, false) 返回计算图对象本身以及其内部数组/表需要的总开销，按计划的节点 max_nodes 来估计
         buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // 是否启用流水线并行的判定，（仅当满足以下全部时）
+        /*
+        1. 设备数量大于 1
+        2. n_gpu_layers > n_layer（按层切分到多设备的场景）
+        3. 切分模式为层级切分
+        4. 启用 KQV 的异地执行( KQV 可下放)
+        */
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.params.n_gpu_layers > (int) model.hparams.n_layer &&
@@ -246,17 +270,22 @@ llama_context::llama_context(
             }
         }
 
+        // 创建调度器，把后端数组， buffer types, 最大节点数， 是否流水线并行， 以及 op_offload 传进去。调度器是把计算图切分到不同后端执行的大脑
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, pipeline_parallel, cparams.op_offload));
 
+        // 流水线并行能提升多设备吞吐，但占用更多内存
+        // 若启用流水线并行，打印 n_copies (流水线副本数)
         if (pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(sched.get()));
         }
     }
 
+    // 在推理前阶段和生成阶段中，模型的计算图和内存缓冲区会有所不同
+    // 为了避免在推理过程中，频繁地重新分配内存，llama.cpp 采用，预先构建计算图（为预填充阶段和生成阶段分别构建计算图），预留内存缓冲区（通过调度器为计算图预留内存缓冲区），避免内存重分配，三种策略
     // reserve worst-case graph
     if (!hparams.vocab_only && memory) {
-        const uint32_t n_seqs = 1; // TODO: worst-case number of sequences
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_seqs = 1; // TODO: worst-case number of sequences 最坏情况下的序列数
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch); // 即预填充阶段的最大 token 数，这通常是最吃内存的，越长的 prefill 越占内存，因此提前按这个上限预留，最坏情况下的最大 token数 
 
         llama_token token = model.vocab.token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
 
@@ -272,45 +301,53 @@ llama_context::llama_context(
         int n_splits_tg = -1;
         int n_nodes_tg  = -1;
 
+        // 将 kv 缓存标记为满，模拟历史对话已写满 KV 的状态（模拟 KV 缓存已满的状态，通过将 KV 缓存标记为已满，模拟历史对话已写满 KV 的状态，以测试在这种情况下的内存分配）
         // simulate full KV cache
         llama_kv_cache * kv_self = static_cast<llama_kv_cache *>(memory.get());
 
-        kv_self->set_full();
+        kv_self->set_full(); 
 
         cross.v_embd.clear();
 
         // reserve pp graph first so that buffers are only allocated once
+        // 先为 prefill（pp）大批量前向建图并预留，然后为 token-generation （TG，bs = 1 ） 建图并预留，最后再预留一次 PP， 以确保 ggml-alloc 在真实推理中的图切换不会触发 reallocate
+        // 先为 PP 阶段按最坏情况建计算图，并向调度器要一整套计算缓冲，并把图的一些统计信息（节点数，切分数）记下来，如果申请失败就抛出异常。这样能在真正推理时避免临时分配/重排，运行更稳定
         {
+            // 构建一份 ubatch 描述，告诉后面的建图逻辑：这次要跑的是 prefill 形态（一次吃很多个 token）
+            /*
+            n_tokens 是本次预留按“最坏情况” 取的 token数，通常等于 min(n_ctx, n_ubatch)， prefill 最吃内存
+            */
             llama_ubatch ubatch_pp = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
 
             // max number of outputs
-            n_outputs = ubatch_pp.n_tokens;
+            n_outputs = ubatch_pp.n_tokens; // 暂时把 n_outputs 设成这次图的最大输出数（对 PP 来说就是这批 token 数）。有些缓冲/图结构会依据可产生的输出数量来定尺寸。
 
             LLAMA_LOG_DEBUG("%s: reserving graph for n_tokens = %d, n_seqs = %d\n", __func__, ubatch_pp.n_tokens, ubatch_pp.n_seqs);
 
-            auto * gf = graph_init();
-            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT);
+            auto * gf = graph_init(); // 创建一张空的计算图句柄
+            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT); // 构建计算图
 
-            if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            if (!ggml_backend_sched_reserve(sched.get(), gf)) { // 这张图交给后端调度器 sched 去 reserve。这会在各个后端上预分配这张图运行所需的中间计算缓冲/工作区，并在必要时对图做切分以适配显存/内存。失败就报异常。
+                // 另外一个相关事实：每次为一张新图做分配，之前那张图所绑定的临时张量/缓冲可能会被调度器重用或者覆盖，因此后面代码会先预留 PP，再预留 TG，然后再预留一次 PP，让最终布局稳定在能同时覆盖两类场景的状态
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
 
             n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
             n_nodes_pp  = ggml_graph_n_nodes(gf);
-        }
+        } // llama.cpp 里会为 PP（多 token） 和 TG（单 token）各建一套图并预留缓冲，这是常见做法
 
-        // reserve with tg graph to get the number of splits and nodes
+        // reserve with tg graph to get the number of splits and nodes  为预填充阶段构建计算图并预留内存
         {
             llama_ubatch ubatch_tg = { true, 1, 1, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
 
-            n_outputs = ubatch_tg.n_tokens;
+            n_outputs = ubatch_tg.n_tokens; // 设置输出数量
 
             LLAMA_LOG_DEBUG("%s: reserving graph for n_tokens = %d, n_seqs = %d\n", __func__, ubatch_tg.n_tokens, ubatch_tg.n_seqs);
 
-            auto * gf = graph_init();
-            graph_build(ctx_compute.get(), gf, ubatch_tg, LLM_GRAPH_TYPE_DEFAULT);
+            auto * gf = graph_init();  // 创建计算图句柄
+            graph_build(ctx_compute.get(), gf, ubatch_tg, LLM_GRAPH_TYPE_DEFAULT); // 构建计算图
 
-            if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            if (!ggml_backend_sched_reserve(sched.get(), gf)) { // 预留内存
                 throw std::runtime_error("failed to allocate compute tg buffers");
             }
 
@@ -318,18 +355,18 @@ llama_context::llama_context(
             n_nodes_tg  = ggml_graph_n_nodes(gf);
         }
 
-        // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+        // reserve again with pp graph to avoid ggml-alloc reallocations during inference 为生成阶段构建计算图并预留内存
         {
             llama_ubatch ubatch_pp = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
 
-            n_outputs = ubatch_pp.n_tokens;
+            n_outputs = ubatch_pp.n_tokens; // 设置输出数量
 
-            LLAMA_LOG_DEBUG("%s: reserving graph for n_tokens = %d, n_seqs = %d\n", __func__, ubatch_pp.n_tokens, ubatch_pp.n_seqs);
+            LLAMA_LOG_DEBUG("%s: reserving graph for n_tokens = %d, n_seqs = %d\n", __func__, ubatch_pp.n_tokens, ubatch_pp.n_seqs); // 
 
-            auto * gf = graph_init();
-            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT);
+            auto * gf = graph_init(); // 创建计算图句柄
+            graph_build(ctx_compute.get(), gf, ubatch_pp, LLM_GRAPH_TYPE_DEFAULT); // 构建计算图
 
-            if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            if (!ggml_backend_sched_reserve(sched.get(), gf)) { // 预留内存
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
         }
@@ -347,6 +384,7 @@ llama_context::llama_context(
             }
         }
 
+        // 输出计算图的节点数和切分数，以供调试和优化
         if (n_nodes_pp == n_nodes_tg) {
             LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
         } else {
@@ -365,15 +403,21 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+/**
+ * @brief 主要负责同步计算并更新与模型推理相关的额性能统计数据。它涉及了模型推理（例如语言模型的生成） 的一些关键时序管理和性能计时。
+ * 
+ */
 void llama_context::synchronize() {
-    ggml_backend_sched_synchronize(sched.get());
+    // sched 可能包含待执行的任务
+    ggml_backend_sched_synchronize(sched.get()); // 确保在统计数据更新或下一步操作前，所有计算任务都已经完成
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
 
-    // add the evaluation to the stats
+    // add the evaluation to the stats  
     if (n_queued_tokens == 1) {
+        // 如果处理的是单个 token， t_eval_us 会记录从 t_compute_start_us 到当前时间的插值
         if (!cparams.no_perf) {
             t_eval_us += ggml_time_us() - t_compute_start_us;
         }
@@ -391,8 +435,8 @@ void llama_context::synchronize() {
         has_evaluated_once = true;
     }
 
-    n_queued_tokens = 0;
-    t_compute_start_us = 0;
+    n_queued_tokens = 0; // 重置排队的 tokens 数量，表示当前没有待处理的 tokens
+    t_compute_start_us = 0; // 重置计算开始的时间戳，准备下一轮的计算
 }
 
 const llama_model & llama_context::get_model() const {
@@ -449,12 +493,16 @@ const llama_kv_cache * llama_context::get_kv_self() const {
     return kv_self;
 }
 
+/**
+ * @brief llama_context::kv_self_update() 用来同步并检查自有 KV 缓存（self KV cache，注意不是 cross-attention 的 KV），如果发现 KV 的布局或容量变了，需要预先为最坏情况构建一张计算图（graph）并把后端调度器的计算/显存缓冲区一次性预留好。这样后面真实推理时就不会因为 batch 长度或上下文长度变化而频繁重新分配显存/内存，减少抖动。
+ * 
+ */
 void llama_context::kv_self_update() {
     bool need_reserve = false;
 
     llama_kv_cache * kv_self = static_cast<llama_kv_cache *>(memory.get());
 
-    need_reserve = kv_self->update(*this);
+    need_reserve = kv_self->update(*this); // 更新 KV 状态，并告诉你是否需要重新做一次容量级的准备工作
 
     // reserve a worst case graph if needed
     if (need_reserve) {
@@ -465,7 +513,7 @@ void llama_context::kv_self_update() {
         uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         // simulate full KV cache
-        kv_self->set_full();
+        kv_self->set_full(); // 把 KV 标记为满来驱动最大需求的形状推导；这一步一般不去改动真实数据，只是影响图构建时的维度计算
 
         llama_token token = model.vocab.token_bos(); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
         llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -475,7 +523,7 @@ void llama_context::kv_self_update() {
 
         // initialize scheduler with the worst-case graph
         ggml_backend_sched_reset(sched.get());
-        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {  // 后端把需要的缓冲区一口气申请出来，避免后面频繁 realloc。
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         }
     }
@@ -846,6 +894,12 @@ int llama_context::encode(llama_batch & inp_batch) {
     return 0;
 }
 
+/**
+ * @brief 把用户给的 batch 规范化 -> 拆成一个或多个 ubatch（物理计算块） -> 为每个 ubatch 构图并在 GGML 后端执行 -> 从后端异步拷回 logits/embedding -> 维护与提交 KV 内存 -> 必要时安排碎片整理
+ * 
+ * @param inp_batch 
+ * @return int 
+ */
 int llama_context::decode(llama_batch & inp_batch) {
     if (!memory) {
         LLAMA_LOG_WARN("%s: cannot decode batches with this context (use llama_encode() instead)\n", __func__);
@@ -867,21 +921,22 @@ int llama_context::decode(llama_batch & inp_batch) {
     llama_kv_cache * kv_self = static_cast<llama_kv_cache *>(memory.get());
 
     // temporary allocate memory for the input batch if needed
-    llama_batch_allocr batch_allocr(inp_batch, inp_batch.pos ? -1 : kv_self->seq_pos_max(0) + 1);
+    // 用 llama_batch_allocr 生成一个规范化的 batch 视图：如果用户没有提供 pos，它会基于 KV 中当前序列的最大位置 seq_pos_max 续接位置，也会为后续按 ubatch 切分准备各种索引映射与一致性检查
+    llama_batch_allocr batch_allocr(inp_batch, inp_batch.pos ? -1 : kv_self->seq_pos_max(0) + 1);  // 构造一个批次分配器。如果调用方已经提供了 batch.pos ，就传 -1 表示“别替我填位置”。 否则用 KV 缓存里 序列 0 的最大已用位置 + 1 作为起始位置，自动补齐本次 token 的pos。当该序列还没有写入过 KV 时， seq_pos_max 返回 -1 ，于是起点会是 0
 
     const llama_batch & batch = batch_allocr.batch;
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
-    const int32_t n_vocab = vocab.n_tokens();
+    const int32_t n_vocab = vocab.n_tokens(); // 词表大小
 
-    const int64_t n_tokens_all = batch.n_tokens;
-    const int64_t n_embd       = hparams.n_embd;
+    const int64_t n_tokens_all = batch.n_tokens; // 本次要处理的 token 数
+    const int64_t n_embd       = hparams.n_embd; // 模型的 embedding 维度
 
-    llama_kv_cache_guard kv_guard(kv_self);
+    llama_kv_cache_guard kv_guard(kv_self); // 典型的 RALL 守卫：如果后续批处理失败，它就会回滚 KV；成功则提交。
 
-    GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
+    GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT 要么喂 token，要么喂外部 embedding，不能同时两边插队。
 
     if (batch.token) {
         for (int64_t i = 0; i < n_tokens_all; ++i) {
@@ -892,8 +947,9 @@ int llama_context::decode(llama_batch & inp_batch) {
         }
     }
 
-    GGML_ASSERT(n_tokens_all <= cparams.n_batch);
-
+    // 批大小约束， n_batch 是逻辑批大小（应用侧一次希望输出/保留多少个位置的结果）
+    GGML_ASSERT(n_tokens_all <= cparams.n_batch); // 本次要处理的 token 数 不能超过 n_batch。在 llama.cpp 里 batch-size 是应用层缓冲
+    // n_ubatch 是物理计算块大小（受设备/后端能力限制的每次最大并行 token 数）
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
     if (t_compute_start_us == 0) {
@@ -906,34 +962,49 @@ int llama_context::decode(llama_batch & inp_batch) {
 
     embd_seq.clear();
 
+    // 这块是统计本批需要从模型取回多少个输出的核心：
+    /**
+         * @brief 普通解码（非 pooled embedding）且 batch.logits 非空：遍历标志数组，只有 batch.logits[i] != 0 的那些位置会产出输出（logits / embedding）。llama_batch.logits 的设计语义正是“哪些 token 位置要回传输出”；这些位置的结果会被按出现顺序连续存放。
+
+pooled embedding 模式：把 n_outputs_all 直接设为 n_tokens_all，也就是对每个 token 位置都先收集（供池化用），因此忽略 batch.logits 的选择性回传逻辑。注意：对外可见的结果在 pooling≠NONE 时通常是“每个序列一个池化后的向量”（而不是每个 token 一个），但在内部计数/收集阶段会先按 token 全量准备，再在图里做池化与归一化。
+
+既没有 batch.logits，也不是 pooled embedding：默认只保留“最后一个 token”的输出（典型的自回归解码场景），这是 llama.h 对“logits == NULL 仅返回最后一个 token 的 logits”这条 API 约定在实现层的体现。
+
+batch.logits[i] 是一个输出掩码：1 表示“请给我第 i 个 token 的输出”，0 表示忽略。没有提供时，默认只给最后一个；提供了就按位挑选，并把这些位置的结果连续返回
+         * 
+         */
     int64_t n_outputs_all = 0;
 
     // count outputs
     if (batch.logits && !embd_pooled) {
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
-            n_outputs_all += batch.logits[i] != 0;
+            n_outputs_all += batch.logits[i] != 0;   // 遍历标志数组，只有 batch.logits[i] != 0 的那些位置会产生输出
         }
     } else if (embd_pooled) {
         n_outputs_all = n_tokens_all;
     } else {
         // keep last output only
-        n_outputs_all = 1;
+        n_outputs_all = 1; // 默认只返回 最后一个 token 的输出 （典型的自回归解码场景）
     }
 
+    // 这里把用户 batch 转成内部“顺序批”（sbatch），并指明是否“对所有 token 取日志”。
     llama_sbatch sbatch = kv_self->sbatch_init(batch, /* logits_all */ n_outputs_all == n_tokens_all);
 
-    // reserve output buffer
+    // reserve output buffer 接着预留 host 侧的 logits / embeddings 输出缓冲，以便从后端拉数据。
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %" PRId64 " outputs\n", __func__, n_outputs_all);
         return -2;
     };
 
     // handle any pending defrags/shifts
+    // 处理任何挂起的 KV “移位/整理”请求（如上下文滑动、碎片整理），以保证后续找 KV 槽位时成功率更高。近期对 KV 更新/碎片整理的机制有过多次重构与修复。
+    // KV一有分吹草动，就用“满仓 KV + 最大批次”构一张保守的大图，立刻把后端的内存/显存预热到位，从而让后续推理一路丝滑
     kv_self_update();
 
     int64_t n_outputs_prev = 0;
 
     while (sbatch.n_tokens > 0) {
+        // 主循环：按 ubatch 执行，从后端取回结果
         llama_ubatch ubatch = kv_self->ubatch_next(sbatch, cparams.n_ubatch, embd_pooled);
 
         // count the outputs in this u_batch
@@ -954,23 +1025,31 @@ int llama_context::decode(llama_batch & inp_batch) {
         }
 
         // find KV slot
+        // 为 ubatch 找 KV 槽位
+        // 若 KV 碎片化严重，可能一时找不到可用槽位，需要触发（或放宽阈值以自动触发）defrag；相关的 issue/PR 也在不断改进这部分的鲁棒性
+        // ubatch 是带有批处理相关的信息
         if (!kv_self->find_slot(ubatch)) {
-            return 1;
+            return 1; // 找不到 KV 槽
         }
 
+        // 调度器的重置和回调设置
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data); // 为调度器设置一个评估回调函数 cb_eval，以及用户数据 cb_eval_user_data。这个回调函数可能在推理过程中被触发，用于执行一些自定义的操作。
 
+        // 这里调用解码器图的构建，把图交给多后端调度器  ggml_backend_sched 来分配/执行；失败时按状态码分类返回。项目讨论里对调度器如何切分/分配，何时 get/set_tensor 都有说明
         auto * gf = graph_init();
         auto res = graph_build(ctx_compute.get(), gf, ubatch, LLM_GRAPH_TYPE_DECODER);
 
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
-        ggml_backend_sched_alloc_graph(sched.get(), gf);
+        // 调度器分配计算资源
+        ggml_backend_sched_alloc_graph(sched.get(), gf); // 由调度器负责分配计算资源，如内存和计算设备（CPU/GPU）。这一步确保了计算图中的每个节点都被正确地分配到适当的计算设备上
 
+        // 将输入数据 ubatch 设置到图 gf 中，意味着图中的每个节点都会获得相应的输入数据，准备进行计算
         res->set_inputs(&ubatch);
 
-        const auto compute_status = graph_compute(gf, ubatch.n_tokens > 1);
+        // 计算状态检查和错误处理
+        const auto compute_status = graph_compute(gf, ubatch.n_tokens > 1); // 执行计算图，开始实际的推理计算
         if (compute_status != GGML_STATUS_SUCCESS) {
             switch (compute_status) {
                 case GGML_STATUS_ABORTED:
@@ -988,24 +1067,31 @@ int llama_context::decode(llama_batch & inp_batch) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        // 这两行代码根据 cparams.embedding 的值来决定是获取logits或者是embdding
         auto * t_logits = cparams.embeddings ? nullptr         : res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
 
+        // 如果有 pooled embedding ，切换 embedding
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
         }
 
         // extract logits
+        // 这段代码的主要功能是处理 logits 和 embedding 数据的提取，并将计算结果异步传回到主机端。它会根据不同的条件选择数据类型，并通过调度器和后端进行异步数据获取。
         if (t_logits && n_outputs > 0) {
+            // 异步拉回 logits/embedding ，先通过调度器拿到结果 tensor 所在后端句柄，再用 *_get_async() 把数据搬回 host 缓冲。维护者解释过：不同后端存储布局可能不同，set_tensor/get_tensor 层会处理必要的交换，且通常只在取得计算结果或跨后端拷贝时调用。
+            // 获取后端句柄
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits != nullptr);
 
+            // 计算 logits_out 的指针位置。假设 logits 是一个连续的内存块，logits_out 是结果存储的起始位置。通过 n_outputs_prev*n_vocab 计算偏移量，确保每个批次的结果不会覆盖之前的结果。
             float * logits_out = logits + n_outputs_prev*n_vocab;
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
+                // 异步获取 logits 数据
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
@@ -1015,6 +1101,7 @@ int llama_context::decode(llama_batch & inp_batch) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
+            // 支持多种 embedding 池化
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
@@ -1068,30 +1155,34 @@ int llama_context::decode(llama_batch & inp_batch) {
         n_outputs_prev += n_outputs;
     }
 
+    // 提交 KV，更换批，安排碎片整理
     // finalize the batch processing
+    // 提交 KV 改动
     kv_guard.commit();
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    n_outputs = n_outputs_all;
+    n_outputs = n_outputs_all; // 供 llama_get_logits_ith 使用
 
     // set output mappings
+    // 这段代码的主要功能是处理映射，确保输出的顺序与用户传入 batch 顺序一致，尤其是在需要保留序列顺序的情况下，如递归模型（Recurrent Models）或并行处理时
     {
-        bool sorted_output = true;
+        bool sorted_output = true; 
 
-        auto & out_ids = sbatch.out_ids;
+        auto & out_ids = sbatch.out_ids; // 这是模型在处理批次时输出的 token id 的列表。代码首先检查 out_ids 是否是按照递增顺序排列的
 
         GGML_ASSERT(out_ids.size() == (size_t) n_outputs_all);
 
         for (int64_t i = 0; i < n_outputs_all; ++i) {
-            int64_t out_id = out_ids[i];
-            output_ids[out_id] = i;
+            int64_t out_id = out_ids[i]; 
+            output_ids[out_id] = i; // 这一步将每个输出的 ID 映射到它在当前批次中的位置（即 i）
             if (out_id != i) {
-                sorted_output = false;
+                sorted_output = false; // sorted_output 这是一个标志位，检查输出 ID 是否与其索引一致。如果发现某个 out_id 与其索引不一致，标志位 sorted_output 会被设置为 false，表示输出顺序被打乱
             }
         }
 
         // make the outputs have the same order they had in the user-provided batch
         // note: this is mostly relevant for recurrent models atm
+        // 若输出顺序被打乱，则重新排序
         if (!sorted_output) {
             const uint32_t n_vocab = model.vocab.n_tokens();
             const uint32_t n_embd  = model.hparams.n_embd;
@@ -1100,6 +1191,8 @@ int llama_context::decode(llama_batch & inp_batch) {
 
             // TODO: is there something more efficient which also minimizes swaps?
             // selection sort, to minimize swaps (from https://en.wikipedia.org/wiki/Selection_sort)
+            // 使用选择排序重新排序
+            // 对于 out_ids 数组，它会遍历所有元素，找到最小的元素并交换位置，从而确保 out_ids 是有序的
             for (int32_t i = 0; i < n_outputs - 1; ++i) {
                 int32_t j_min = i;
                 for (int32_t j = i + 1; j < n_outputs; ++j) {
@@ -1131,13 +1224,15 @@ int llama_context::decode(llama_batch & inp_batch) {
     //synchronize();
 
     // decide if we need to defrag the kv cache
+    // 按阈值安排 KV defrag
     if (cparams.defrag_thold > 0.0f) {
+        // 这不会立刻阻塞式整理，而是把整理请求安排进日程，由后续 kv_self_update() 等环节择机执行。 KV 碎片整理相关议题在项目里很多：原因是长上下文，并发/复用下很容易产生“洞”；近期也在迭代更好的整理策略与 bug 修复
         kv_self->defrag_sched(cparams.defrag_thold);
     }
 
     // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
     // overlap with device computation.
-    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_reset(sched.get()); // 调度器 reset，为下一轮做准备
 
     return 0;
 }
@@ -1261,23 +1356,35 @@ llm_graph_result_ptr llama_context::graph_build(
             }, gf, gtype);
 }
 
+/**
+ * @brief 为一次图(gf)计算 配置并行度与线程池，然后把图提交给多后端调度器异步执行
+ * 
+ * @param gf 
+ * @param batched 
+ * @return ggml_status 
+ */
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    // 根据 batched 选择并行配置，为什么要区分：批处理时算子工作量更大，适合开更过线程。单 token 时工作量小，线程多了反而会受同步/调度开销影响
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
-    ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+    ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;  // 要给 CPU 后端设置的线程池对象（ggml自己的线程池），批处理和非批处理各用一个， 减少和其他任务的抢占和过度订阅
 
-    if (backend_cpu != nullptr) {
+    if (backend_cpu != nullptr) {  // 给 CPU 后端注入线程池
+        // 通过设备注册表 reg 动态查找（dlsym 风格）CPU 后端的 ggml_backend_cpu_set_threadpool 符号，然后把选好的线程池 tp 设置给 backend_cp。
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        // 之所以用“查符号”的方式，是为了避免在编译期强依赖某个具体后端头文件；统一通过后端注册表按名字拿函数指针，便于可插拔的后端体系（CPU、CUDA、Metal、Vulkan…）。
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
         set_threadpool_fn(backend_cpu, tp);
     }
 
     // set the number of threads for all the backends
+    // 给所有后端设置算子级线程数
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // 异步提交图到调度器执行
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2433,13 +2540,13 @@ llama_pos llama_kv_self_seq_pos_max(llama_context * ctx, llama_seq_id seq_id) {
 }
 
 void llama_kv_self_defrag(llama_context * ctx) {
-    auto * kv = ctx->get_kv_self();
+    auto * kv = ctx->get_kv_self(); // 定义了一个帮忙函数，作用域只在当前翻译上下文里动手。从上下文里拿自注意力用的 KV 缓存对象。KV 缓存里存的是过往 token 的 key/value，用来加速后续解码
     if (!kv) {
         return;
     }
 
     // force defrag
-    kv->defrag_sched(-1.0f);
+    kv->defrag_sched(-1.0f); // 调用缓存的安排碎片整理接口。这里传 -1.0f，表示“强制整理”，不管当前碎片化程度如何。实际的整理通常在下一轮图执行/更新时发生，而不是立刻把整个程序卡住
 }
 
 bool llama_kv_self_can_shift(const llama_context * ctx) {
@@ -2573,11 +2680,14 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    int ret = ctx->decode(batch);
+    int ret = ctx->decode(batch); // 调用底层 ctx->decode　处理一个 batch （一批 token，可包含多条并行序列） 。
+    // 返回 1 ，代表“找不到 KVCache 的空槽位”， kV 缓存满 或者 碎片化严重，无法为这批 token 分配位置
 
     // defrag and try again
     // TODO: distinguish return code when we are sure that even after defrag there is no space available
+    // 
     if (ret == 1) {
+        // 如果 KVCache 键值缓存不够用就整理 defrag ，然后再是一次 decode，按返回码记录日志并把结果返回
         llama_kv_self_defrag(ctx);
         ret = ctx->decode(batch);
 
