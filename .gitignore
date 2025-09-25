@@ -71,6 +71,7 @@ autogen-*.md
 
 /main
 /server
+/data/
 
 # CI
 
